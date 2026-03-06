@@ -43,6 +43,16 @@ class Builder:
                 self.builds[build_id]["exit_code"] = -1
                 return
 
+            # Fetch latest commits to ensure base_commit is available
+            logger.info("Build %s: fetching latest commits", build_id)
+            proc = await asyncio.create_subprocess_exec(
+                "git", "fetch", "--all",
+                cwd=self.repo_path,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            await proc.communicate()
+
             # Verify base commit exists
             proc = await asyncio.create_subprocess_exec(
                 "git", "cat-file", "-t", base_commit,
@@ -54,8 +64,8 @@ class Builder:
             if proc.returncode != 0:
                 self.builds[build_id]["status"] = "error"
                 self.builds[build_id]["logs"] = (
-                    f"Base commit {base_commit} not found. "
-                    f"Please fetch/pull the repository.\n{stderr.decode()}"
+                    f"Base commit {base_commit} not found even after fetch. "
+                    f"Please push your commits and try again.\n{stderr.decode()}"
                 )
                 self.builds[build_id]["exit_code"] = -1
                 return
