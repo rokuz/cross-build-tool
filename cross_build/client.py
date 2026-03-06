@@ -69,18 +69,23 @@ async def send_build(peer, patch_data, timeout=300):
     port = peer["port"]
     base_url = f"http://{ip}:{port}"
 
+    hostname = peer.get("hostname", ip)
+    logger.info("Sending build request to %s (%s:%s)", hostname, ip, port)
+
     async with aiohttp.ClientSession() as session:
         async with session.post(
             f"{base_url}/api/build", json=patch_data, timeout=aiohttp.ClientTimeout(total=30)
         ) as resp:
             result = await resp.json()
             if "error" in result:
+                logger.error("Build request to %s failed: %s", hostname, result["error"])
                 return {
                     "status": "error",
                     "logs": result["error"],
                     "exit_code": -1,
                 }
             build_id = result["build_id"]
+            logger.info("Build accepted by %s, build_id=%s", hostname, build_id)
 
         elapsed = 0
         while elapsed < timeout:
@@ -93,10 +98,15 @@ async def send_build(peer, patch_data, timeout=300):
                 ) as resp:
                     result = await resp.json()
                     if result.get("status") in ("success", "failed", "error"):
+                        logger.info(
+                            "Build result from %s: status=%s exit_code=%s",
+                            hostname, result.get("status"), result.get("exit_code"),
+                        )
                         return result
             except Exception as e:
-                logger.warning("Polling %s failed: %s", peer["hostname"], e)
+                logger.warning("Polling %s failed: %s", hostname, e)
 
+    logger.warning("Build on %s timed out after %ss", hostname, timeout)
     return {"status": "timeout", "logs": "Build timed out", "exit_code": -1}
 
 
