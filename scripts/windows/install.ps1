@@ -10,15 +10,23 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-$ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-$PkgDir = (Resolve-Path "$ScriptDir\..\..").Path
+$PkgDir = (Resolve-Path "$PSScriptRoot\..\..").Path
 $VenvDir = Join-Path $PkgDir ".venv"
 $PythonExe = Join-Path $VenvDir "Scripts\python.exe"
 $TaskName = "CrossBuildService"
+
+if (-not (Test-Path $RepoPath)) {
+    Write-Error "RepoPath does not exist: $RepoPath"
+    return
+}
 $RepoPath = (Resolve-Path $RepoPath).Path
 
 # Create venv if needed
 if (-not (Test-Path $PythonExe)) {
+    if (-not (Get-Command python -ErrorAction SilentlyContinue)) {
+        Write-Error "python not found on PATH. Install Python first."
+        return
+    }
     Write-Host "Creating venv at $VenvDir..."
     python -m venv $VenvDir
     & (Join-Path $VenvDir "Scripts\pip.exe") install --quiet -r (Join-Path $PkgDir "requirements.txt")
@@ -51,6 +59,7 @@ Register-ScheduledTask `
     -Action $action `
     -Trigger $trigger `
     -Settings $settings `
+    -User $env:USERNAME `
     -Description "Cross-Platform Build Service" | Out-Null
 
 Write-Host ""
