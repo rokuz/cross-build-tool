@@ -1,4 +1,5 @@
 import asyncio
+import ipaddress
 import json
 import logging
 import platform
@@ -21,6 +22,26 @@ def get_local_ip():
         return ip
     except Exception:
         return "127.0.0.1"
+
+
+def _get_broadcast_addresses():
+    """Compute subnet-directed broadcast addresses.
+
+    On Windows, sending to 255.255.255.255 (limited broadcast) is unreliable
+    when multiple network adapters are present (Hyper-V, Docker, VPN, etc.).
+    Subnet-directed broadcasts (e.g. 192.168.1.255) are routed correctly.
+    """
+    addrs = set()
+    try:
+        local_ip = get_local_ip()
+        if local_ip != "127.0.0.1":
+            network = ipaddress.IPv4Network(f"{local_ip}/24", strict=False)
+            addrs.add(str(network.broadcast_address))
+    except Exception:
+        pass
+    # Always include limited broadcast as fallback (works on Linux/macOS)
+    addrs.add("255.255.255.255")
+    return list(addrs)
 
 
 class _DiscoveryProtocol(asyncio.DatagramProtocol):
@@ -87,7 +108,11 @@ class Discovery:
                 msg = json.dumps(
                     {**self.service_info, "ip": get_local_ip()}
                 ).encode()
-                self._transport.sendto(msg, ("<broadcast>", DISCOVERY_PORT))
+                for addr in _get_broadcast_addresses():
+                    try:
+                        self._transport.sendto(msg, (addr, DISCOVERY_PORT))
+                    except OSError:
+                        pass
             except Exception as e:
                 logger.warning("Discovery announce failed: %s", e)
 
