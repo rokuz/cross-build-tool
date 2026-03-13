@@ -146,11 +146,15 @@ async def _run_discover(args):
 async def _run_build(args):
     from .client import build_on_peers
 
+    def on_output(plat, hostname, line):
+        print(f"[{plat}/{hostname}] {line}", file=sys.stderr, flush=True)
+
     results = await build_on_peers(
         repo_path=args.repo,
         targets=args.targets,
         build_commands=args.commands,
         timeout=args.timeout,
+        on_output=on_output,
     )
     print(json.dumps(results, indent=2))
 

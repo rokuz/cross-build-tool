@@ -63,8 +63,12 @@ async def discover_peers(timeout=5):
     return list(peers.values())
 
 
-async def send_build(peer, patch_data, timeout=300):
-    """Send a build request to a peer and poll until completion."""
+async def send_build(peer, patch_data, timeout=300, on_output=None):
+    """Send a build request to a peer and stream/poll until completion.
+
+    If on_output callback is provided, streams build output in real-time
+    via SSE. Falls back to polling if streaming is unavailable.
+    """
     ip = peer.get("ip") or peer.get("addr")
     port = peer["port"]
     base_url = f"http://{ip}:{port}"
@@ -86,6 +90,15 @@ async def send_build(peer, patch_data, timeout=300):
                 }
             build_id = result["build_id"]
             logger.info("Build accepted by %s, build_id=%s", hostname, build_id)
+
+        # Try SSE streaming if callback provided
+        if on_output:
+            result = await _stream_build(
+                session, base_url, build_id, hostname, timeout, on_output
+            )
+            if result is not None:
+                return result
+            # Fall through to polling if streaming failed
 
         elapsed = 0
         while elapsed < timeout:
@@ -110,15 +123,55 @@ async def send_build(peer, patch_data, timeout=300):
     return {"status": "timeout", "logs": "Build timed out", "exit_code": -1}
 
 
+async def _stream_build(session, base_url, build_id, hostname, timeout, on_output):
+    """Connect to SSE stream endpoint and relay output lines. Returns build
+    result dict on success, or None if streaming is unavailable."""
+    try:
+        async with session.get(
+            f"{base_url}/api/build/{build_id}/stream",
+            timeout=aiohttp.ClientTimeout(total=timeout),
+        ) as resp:
+            if resp.status != 200:
+                logger.debug("Stream endpoint returned %s, falling back to polling", resp.status)
+                return None
+
+            current_event = None
+            async for raw_line in resp.content:
+                line_str = raw_line.decode(errors="replace").rstrip("\n\r")
+                if not line_str:
+                    current_event = None
+                    continue
+                if line_str.startswith("event: "):
+                    current_event = line_str[7:]
+                elif line_str.startswith("data: "):
+                    data = json.loads(line_str[6:])
+                    if current_event == "done":
+                        logger.info(
+                            "Build result from %s: status=%s exit_code=%s",
+                            hostname, data.get("status"), data.get("exit_code"),
+                        )
+                        return data
+                    elif "line" in data:
+                        on_output(data["line"])
+    except Exception as e:
+        logger.warning("Streaming from %s failed: %s, falling back to polling", hostname, e)
+        return None
+
+    return None
+
+
 def get_current_platform():
     return platform.system().lower()
 
 
-async def build_on_peers(repo_path, targets=None, build_commands=None, timeout=300):
+async def build_on_peers(repo_path, targets=None, build_commands=None, timeout=300, on_output=None):
     """Create patch, discover peers, send builds, collect results.
 
     Automatically detects the current platform and targets only OTHER platforms.
     Reports platform coverage (which of linux/windows/darwin are covered).
+
+    If on_output(platform, hostname, line) is provided, build output is
+    streamed in real-time.
     """
     current_platform = get_current_platform()
     peers = await discover_peers()
@@ -155,7 +208,16 @@ async def build_on_peers(repo_path, targets=None, build_commands=None, timeout=3
     if build_commands:
         patch_data["build_commands"] = build_commands
 
-    tasks = [send_build(peer, patch_data, timeout) for peer in peers]
+    def _peer_callback(peer):
+        def cb(line):
+            on_output(peer["platform"], peer["hostname"], line)
+        return cb
+
+    tasks = [
+        send_build(peer, patch_data, timeout,
+                   on_output=_peer_callback(peer) if on_output else None)
+        for peer in peers
+    ]
     results = await asyncio.gather(*tasks, return_exceptions=True)
 
     combined = []

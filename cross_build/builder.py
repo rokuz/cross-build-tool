@@ -9,11 +9,46 @@ import uuid
 logger = logging.getLogger(__name__)
 
 
+class BuildLog:
+    """Async log buffer supporting real-time followers."""
+
+    def __init__(self):
+        self.lines = []
+        self.finished = False
+        self._condition = asyncio.Condition()
+
+    async def append(self, line):
+        async with self._condition:
+            self.lines.append(line)
+            self._condition.notify_all()
+
+    async def finish(self):
+        async with self._condition:
+            self.finished = True
+            self._condition.notify_all()
+
+    async def follow(self, start=0):
+        """Async generator yielding log lines as they arrive."""
+        pos = start
+        while True:
+            async with self._condition:
+                while pos >= len(self.lines) and not self.finished:
+                    await self._condition.wait()
+                new_lines = self.lines[pos:]
+                pos = len(self.lines)
+                finished = self.finished
+            for line in new_lines:
+                yield line
+            if finished:
+                break
+
+
 class Builder:
     def __init__(self, repo_path, build_commands):
         self.repo_path = repo_path
         self.build_commands = build_commands
         self.builds = {}
+        self.build_logs = {}
 
     async def start_build(self, patch_data):
         build_id = uuid.uuid4().hex[:8]
@@ -23,11 +58,16 @@ class Builder:
             "logs": "",
             "exit_code": None,
         }
+        self.build_logs[build_id] = BuildLog()
         asyncio.create_task(self._run_build(build_id, patch_data))
         return build_id
 
+    def get_build_log(self, build_id):
+        return self.build_logs.get(build_id)
+
     async def _run_build(self, build_id, patch_data):
         worktree_path = None
+        build_log = self.build_logs[build_id]
         try:
             base_commit = patch_data["base_commit"]
             diff = patch_data.get("diff", "")
@@ -35,12 +75,14 @@ class Builder:
             build_commands = patch_data.get("build_commands") or self.build_commands
 
             if not build_commands:
-                self.builds[build_id]["status"] = "error"
-                self.builds[build_id]["logs"] = (
+                msg = (
                     "No build commands configured. "
                     "Set them in cross_build.json or pass via --cmd."
                 )
+                self.builds[build_id]["status"] = "error"
+                self.builds[build_id]["logs"] = msg
                 self.builds[build_id]["exit_code"] = -1
+                await build_log.append(msg)
                 return
 
             # Fetch latest commits to ensure base_commit is available
@@ -62,12 +104,14 @@ class Builder:
             )
             _, stderr = await proc.communicate()
             if proc.returncode != 0:
-                self.builds[build_id]["status"] = "error"
-                self.builds[build_id]["logs"] = (
+                msg = (
                     f"Base commit {base_commit} not found even after fetch. "
                     f"Please push your commits and try again.\n{stderr.decode()}"
                 )
+                self.builds[build_id]["status"] = "error"
+                self.builds[build_id]["logs"] = msg
                 self.builds[build_id]["exit_code"] = -1
+                await build_log.append(msg)
                 return
 
             # Create worktree
@@ -82,11 +126,11 @@ class Builder:
             )
             _, stderr = await proc.communicate()
             if proc.returncode != 0:
+                msg = f"Failed to create worktree:\n{stderr.decode()}"
                 self.builds[build_id]["status"] = "error"
-                self.builds[build_id]["logs"] = (
-                    f"Failed to create worktree:\n{stderr.decode()}"
-                )
+                self.builds[build_id]["logs"] = msg
                 self.builds[build_id]["exit_code"] = -1
+                await build_log.append(msg)
                 return
 
             # Apply diff
@@ -102,11 +146,11 @@ class Builder:
                     input=diff.encode(errors="surrogateescape")
                 )
                 if proc.returncode != 0:
+                    msg = f"Failed to apply patch:\n{stderr.decode()}"
                     self.builds[build_id]["status"] = "error"
-                    self.builds[build_id]["logs"] = (
-                        f"Failed to apply patch:\n{stderr.decode()}"
-                    )
+                    self.builds[build_id]["logs"] = msg
                     self.builds[build_id]["exit_code"] = -1
+                    await build_log.append(msg)
                     return
 
             # Write new files
@@ -136,7 +180,9 @@ class Builder:
             logs = []
             final_exit_code = 0
             for cmd in build_commands:
-                logs.append(f"$ {cmd}")
+                header = f"$ {cmd}"
+                logs.append(header)
+                await build_log.append(header)
                 logger.info("Build %s: running %r", build_id, cmd)
                 proc = await asyncio.create_subprocess_shell(
                     cmd,
@@ -145,13 +191,20 @@ class Builder:
                     stderr=asyncio.subprocess.STDOUT,
                     env={**os.environ, "CROSS_BUILD": "1"},
                 )
-                stdout, _ = await proc.communicate()
-                output = stdout.decode(errors="replace")
-                logs.append(output)
+                output_lines = []
+                while True:
+                    line = await proc.stdout.readline()
+                    if not line:
+                        break
+                    text = line.decode(errors="replace").rstrip("\n\r")
+                    output_lines.append(text)
+                    await build_log.append(text)
+                await proc.wait()
+                logs.append("\n".join(output_lines))
                 if proc.returncode != 0:
-                    logs.append(
-                        f"Command failed with exit code {proc.returncode}"
-                    )
+                    msg = f"Command failed with exit code {proc.returncode}"
+                    logs.append(msg)
+                    await build_log.append(msg)
                     final_exit_code = proc.returncode
                     break
 
@@ -163,10 +216,13 @@ class Builder:
 
         except Exception as e:
             logger.exception("Build %s error", build_id)
+            msg = f"Build error: {e}"
             self.builds[build_id]["status"] = "error"
-            self.builds[build_id]["logs"] = f"Build error: {e}"
+            self.builds[build_id]["logs"] = msg
             self.builds[build_id]["exit_code"] = -1
+            await build_log.append(msg)
         finally:
+            await build_log.finish()
             if worktree_path and os.path.exists(worktree_path):
                 try:
                     proc = await asyncio.create_subprocess_exec(
