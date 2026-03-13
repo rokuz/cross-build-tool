@@ -116,10 +116,20 @@ class Builder:
                 with open(full_path, "wb") as f:
                     f.write(base64.b64decode(content_b64))
 
-            # If python3 is not available, fall back to python
+            # If python3 is not usable, fall back to python
             if any("python3" in cmd for cmd in build_commands):
-                if not shutil.which("python3"):
-                    logger.info("Build %s: python3 not found, falling back to python", build_id)
+                try:
+                    proc = await asyncio.create_subprocess_exec(
+                        "python3", "--version",
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                    )
+                    await proc.communicate()
+                    python3_works = proc.returncode == 0
+                except FileNotFoundError:
+                    python3_works = False
+                if not python3_works:
+                    logger.info("Build %s: python3 not usable, falling back to python", build_id)
                     build_commands = [cmd.replace("python3", "python") for cmd in build_commands]
 
             # Run build commands
